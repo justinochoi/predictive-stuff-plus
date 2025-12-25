@@ -5,7 +5,6 @@ from sklearn.metrics import mean_squared_error
 import xgboost as xgb 
 import optuna 
 import seaborn as sns 
-import matplotlib.pyplot as plt 
 
 statcast20 = pl.read_parquet('/Users/justinchoi/BaseballData/statcast_20.parquet')
 statcast21 = pl.read_parquet('/Users/justinchoi/BaseballData/statcast_21.parquet')
@@ -76,7 +75,7 @@ def xgb_objective(trial):
     return np.mean(cv_scores)
 
 study = optuna.create_study(direction='minimize')
-study.optimize(xgb_objective, n_trials = 30) 
+study.optimize(xgb_objective, n_trials = 10) 
 best_params = study.best_params 
 
 xgb_spec = xgb.XGBRegressor(**best_params) 
