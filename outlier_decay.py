@@ -1,11 +1,12 @@
 import polars as pl 
 import numpy as np 
 from sklearn.ensemble import IsolationForest 
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error
 import seaborn as sns 
 import matplotlib.pyplot as plt 
-import bambi as bmb 
-import arviz as az 
+import xgboost as xgb 
+import optuna 
 
 statcast20 = pl.read_parquet('/Users/justinchoi/BaseballData/statcast_20.parquet')
 statcast21 = pl.read_parquet('/Users/justinchoi/BaseballData/statcast_21.parquet')
@@ -20,7 +21,7 @@ del statcast20, statcast21, statcast22, statcast23
 
 cols = [
     'player_name','pitcher','game_date','p_throws','pitch_type',
-    'release_speed','pfx_x','pfx_z','delta_run_exp'
+    'release_speed','pfx_x','pfx_z','release_extension','arm_angle','delta_pitcher_run_exp'
 ]
 
 df_reduced = (
@@ -39,12 +40,11 @@ df_reduced = (
         pl.col('game_date').dt.year().alias('season')
     ).filter(
         pl.col('pitch_type').is_in(['FF','FC','SI','SL','ST','CU','CH','FS'])
-    )
+    ).sort(pl.col('game_date'))
 )
 
 # calculate the outlier scores for each year 
 # we're only allowed to use current year to fit the IsoForest 
-
 def generate_outlier_scores(df, feats): 
 
     dfs = [] 
@@ -59,6 +59,131 @@ def generate_outlier_scores(df, feats):
     return pl.concat(dfs)
 
 df_reduced = generate_outlier_scores(df_reduced, feats = ['release_speed','pfx_x_adj','pfx_z'])
+df_reduced.write_parquet('df_with_outlier_scores.parquet')
+
+# KNOWING 2023 OUTLIER SCORE IN ADVANCE IS DATA LEAKAGE!!!! 
+
+# stuff+ model with outlier score included 
+train = df_reduced.filter(pl.col('season').is_between(2020, 2022))
+test = df_reduced.filter(pl.col('season') == 2023)
+
+feats = ['release_speed','pfx_x_adj','pfx_z','release_extension','arm_angle','outlier_score']
+target = ['delta_pitcher_run_exp'] 
+
+X = train[feats].to_pandas() 
+y = train[target].to_pandas() 
+
+def xgb_objective(trial): 
+    params = {
+        "objective": "reg:squarederror",
+        "n_estimators": 500,
+        "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.1, log=True),
+        "max_depth": trial.suggest_int("max_depth", 1, 10),
+        "subsample": trial.suggest_float("subsample", 0.05, 1.0),
+        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.05, 1.0),
+        "min_child_weight": trial.suggest_int("min_child_weight", 1, 20), 
+    }
+    
+    cv = TimeSeriesSplit(n_splits=5)
+    cv_scores = [] 
+
+    for train_idx, val_idx in cv.split(X, y): 
+        X_train, X_val = X.iloc[train_idx], X.iloc[val_idx] 
+        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx] 
+
+        model = xgb.XGBRegressor(**params, random_state=76) 
+        model.fit(X_train, y_train, verbose = 0) 
+        val_preds = model.predict(X_val) 
+        rmse = np.sqrt(mean_squared_error(y_val, val_preds)) 
+        cv_scores.append(rmse) 
+
+    return np.mean(cv_scores)
+
+study = optuna.create_study(direction='minimize')
+study.optimize(xgb_objective, n_trials = 20) 
+best_params = study.best_params 
+
+xgb_spec = xgb.XGBRegressor(**best_params) 
+xgb_spec.fit(X, y)
+
+rv_preds = xgb_spec.predict(test[feats])  
+test = test.with_columns(predicted_rv = rv_preds) 
+
+# check model calibration by grouping pitcher + pitch type 
+validation = (
+    test.group_by(
+        ['player_name','pitcher','pitch_type']
+    ).agg(
+        pl.len().alias('num_pitches'), 
+        pl.col('delta_pitcher_run_exp').mean().alias('mean_actual_rv'), 
+        pl.col('predicted_rv').mean().alias('mean_pred_rv') 
+    ).filter(
+        pl.col('num_pitches') >= 200
+    )
+)
+
+# not the best, but not the worst either 
+fig, ax = plt.subplots() 
+sns.scatterplot(validation, x='mean_actual_rv', y='mean_pred_rv')
+
+monthly_st = (
+    test.filter(
+        pl.col('pitch_type') == 'ST'
+    ).group_by(
+        pl.col('game_date').dt.month().alias('month'), 
+        maintain_order=True 
+    ).agg(
+        pl.len().alias('num_pitches'), 
+        pl.col('delta_pitcher_run_exp').mean().alias('mean_actual_rv'), 
+        pl.col('predicted_rv').mean().alias('mean_pred_rv'), 
+    ).filter(
+        pl.col('month').is_between(4,9)
+    ).unpivot(
+        index = ['month','num_pitches'], 
+        on = ['mean_actual_rv', 'mean_pred_rv'], 
+        variable_name = 'type', 
+        value_name = 'run_value'
+    ).with_columns(
+        run_value = pl.col('run_value') * 100
+    )
+)
+
+fig, ax = plt.subplots()
+sns.lineplot(monthly_st, x='month', y='run_value', hue='type') 
+
+pitch_type = (
+    test.group_by(
+        'pitch_type'
+    ).agg(
+        pl.len().alias('num_pitches'), 
+        pl.col('delta_pitcher_run_exp').mean().alias('mean_actual_rv'), 
+        pl.col('predicted_rv').mean().alias('mean_pred_rv'), 
+    ).with_columns(
+        rv_diff_per_100 = (pl.col('mean_pred_rv') - pl.col('mean_actual_rv')) * 100,
+    ).filter(
+        pl.col('pitch_type').is_in(['FF','SI','FC','SL','CU','CH','ST'])
+    ).sort('rv_diff_per_100', descending=True)
+)
+
+# very interesting as sweepers are no longer over-predicted 
+fig, ax = plt.subplots()  
+fig.suptitle('A Somewhat Unavoidable Pitfall of Stuff+', fontsize=16, fontweight='bold') 
+ax.set_xlabel('Run Value Residuals per 100'), 
+ax.set_ylabel('Pitch Type')
+ax.set_title('Model trained on 2020-22, predictions for 2023')
+ax.text(
+    -0.15, 7.5, "Under-predicted", size=9, ha='center', va='center',
+    bbox=dict(boxstyle='larrow', fc='lightblue', ec='steelblue', lw=2)
+)
+ax.text(
+    0.075, 7.5, "Over-predicted", size=9, ha='center', va='center',
+    bbox=dict(boxstyle='rarrow', fc='lightblue', ec='steelblue', lw=2)
+)
+sns.barplot(pitch_type, x='rv_diff_per_100', y='pitch_type', hue='pitch_type')
+
+# save model 
+xgb_spec.save_model('xgb_with_outlier_score.json')
+
 
 # how have outlier scores changed over the years by pitch type? 
 score_by_ptype = (
@@ -124,139 +249,3 @@ def create_outlier_dataset(df):
     return pl.concat(dfs)
 
 outlier_df = create_outlier_dataset(df_reduced)
-
-# league-wide average score change is 0, which is what you'd expect 
-outlier_df['score_change'].mean() 
-
-# also as expected, sweepers' outlier score changes are skewed positively 
-outlier_df_st = outlier_df.filter(pl.col('pitch_type') == 'ST')
-fig, ax = plt.subplots() 
-sns.histplot(outlier_df_st['score_change'])
-
-# split into train (2020-22) and test (2023) 
-train = outlier_df.filter(pl.col('season').is_between(2020, 2021), pl.col('season_fut').is_between(2021, 2022))
-test = outlier_df.filter(pl.col('season') == 2022, pl.col('season_fut') == 2023)
-
-# now time to build the model? 
-# num pitches + velo + movement + pitch type
-
-outlier_mod = bmb.Model(
-    'mean_outlier_score_fut ~ mean_outlier_score + mean_velo + mean_pfx_x_adj*pitch_type + mean_pfx_z + (1 | pitcher)', 
-    data = train.to_pandas(), family = 't'
-)
-
-outlier_mod_idata = outlier_mod.fit(
-    tune=1000, draws=1500, chains=4, cores=4, 
-    random_seed=76, idata_kwargs={'log_likelihood': True}
-)
-
-# model summary and trace plots 
-az.summary(outlier_mod_idata, var_names = ['mean_velo', 'mean_pfx_x_adj', 'mean_outlier_score']) 
-az.plot_trace(outlier_mod_idata, var_names = ['mean_velo', 'mean_pfx_x_adj', 'mean_outlier_score'])
-
-# fitted values on training set 
-fitted = outlier_mod.predict(
-    outlier_mod_idata, data = train, kind = "response", 
-    include_group_specific=False, inplace=False
-)
-fitted_means = az.extract(fitted, group='posterior_predictive', num_samples=500, combined=True)['mean_outlier_score_fut'].mean(dim='sample').values 
-train = train.with_columns(pred_score = fitted_means)
-
-# looks good 
-fig, ax = plt.subplots() 
-sns.scatterplot(train, x='pred_score', y='mean_outlier_score_fut') 
-
-# predictions on test set 
-# remove the player random effect to prevent data leakage 
-preds = outlier_mod.predict(
-    outlier_mod_idata, data = test, kind = "response", 
-    include_group_specific=False, inplace=False
-)
-preds_means = az.extract(preds, group='posterior_predictive', num_samples=500, combined=True)['mean_outlier_score_fut'].mean(dim='sample').values 
-test = test.with_columns(pred_score = preds_means)
-
-# also looks good 
-fig, ax = plt.subplots() 
-sns.scatterplot(test, x='pred_score', y='mean_outlier_score_fut') 
-
-# future run value model 
-# compare using actual past outlier score vs. predicted future outlier score 
-# also include control 
-
-rv_mod_control = bmb.Model(
-    'mean_rv_fut ~ mean_velo + mean_pfx_x_adj*pitch_type + mean_pfx_z + (1 | pitcher)', 
-    data = train.to_pandas(), family = 't'
-)
-
-rv_mod_control_idata = rv_mod_control.fit(
-    draws=1500, tune=1000, chains=4, cores=4, 
-    random_seed=76, idata_kwargs={'log_likelihood': True}
-)
-
-rv_mod_basic = bmb.Model(
-    'mean_rv_fut ~ mean_outlier_score + mean_velo + mean_pfx_x_adj*pitch_type + mean_pfx_z + (1 | pitcher)', 
-    data = train.to_pandas(), family = 't'
-)
-
-rv_mod_basic_idata = rv_mod_basic.fit(
-    draws=1500, tune=1000, chains=4, cores=4, 
-    random_seed=76, idata_kwargs={'log_likelihood': True}
-)
-
-rv_mod_pred = bmb.Model(
-    'mean_rv_fut ~ pred_score + mean_velo + mean_pfx_x_adj*pitch_type + mean_pfx_z + (1 | pitcher)', 
-    data = train.to_pandas(), family = 't'
-)
-
-rv_mod_pred_idata = rv_mod_pred.fit(
-    draws=1500, tune=1000, chains=4, cores=4, 
-    random_seed=76, idata_kwargs={'log_likelihood': True}
-)
-
-# compare the three models 
-compare_dict = {
-    'control': rv_mod_control_idata, 
-    'basic': rv_mod_basic_idata, 
-    'with_predicted_score': rv_mod_pred_idata
-}
-
-# we do beat the control 
-# the model with the predicted score is ever-so-slightly better 
-# but well within the margin of error... 
-compare_results = az.compare(compare_dict)
-az.plot_compare(compare_results)
-
-# get oos predictions for all mdoels 
-rv_control_preds = rv_mod_control.predict(
-    rv_mod_control_idata, kind = 'response', data = test, 
-    inplace=False, include_group_specific=False
-)
-rv_basic_preds = rv_mod_basic.predict(
-    rv_mod_basic_idata, kind = 'response', data = test, 
-    inplace=False, include_group_specific=False
-)
-rv_pred_preds = rv_mod_pred.predict(
-    rv_mod_pred_idata, kind = 'response', data = test, 
-    inplace=False, include_group_specific=False
-)
-
-rv_control_means = az.extract(rv_control_preds, group='posterior_predictive', combined=True)['mean_rv_fut'].mean(dim='sample').values 
-rv_basic_means = az.extract(rv_basic_preds, group='posterior_predictive', combined=True)['mean_rv_fut'].mean(dim='sample').values 
-rv_pred_means = az.extract(rv_pred_preds, group='posterior_predictive', combined=True)['mean_rv_fut'].mean(dim='sample').values 
-test = test.with_columns(
-    control_rv = rv_control_means, 
-    basic_rv = rv_basic_means, 
-    pred_rv = rv_pred_means
-)
-
-# calculating rmse 
-# basically no improvement at all 
-np.sqrt(mean_squared_error(test['mean_rv_fut'], test['control_rv']))
-np.sqrt(mean_squared_error(test['mean_rv_fut'], test['basic_rv']))
-np.sqrt(mean_squared_error(test['mean_rv_fut'], test['pred_rv']))
-
-# any hope for just sweepers? 
-st_test = test.filter(pl.col('pitch_type') == 'ST') 
-np.sqrt(mean_squared_error(st_test['mean_rv_fut'], st_test['basic_rv']))
-np.sqrt(mean_squared_error(st_test['mean_rv_fut'], st_test['pred_rv']))
-# nope... 
