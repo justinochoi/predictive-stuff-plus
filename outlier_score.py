@@ -21,9 +21,7 @@ def generate_outlier_scores(df, feats):
 
 df_reduced = generate_outlier_scores(df_reduced, feats = ['release_speed','pfx_x_adj','pfx_z'])
 
-# KNOWING 2023 OUTLIER SCORE IN ADVANCE IS DATA LEAKAGE!!!! 
-# we need a model that can predict 2023 outlier score 
-
+# create data that we can use for downstream run value prediction models 
 def create_outlier_dataset(df): 
 
     dfs = [] 

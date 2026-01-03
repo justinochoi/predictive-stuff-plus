@@ -1,6 +1,7 @@
 import pybaseball as pb 
 from pybaseball import cache 
 
+# just for personal purposes 
 cache.enable() 
 
 statcast20 = pb.statcast(start_dt='2020-07-23', end_dt='2020-09-27')
